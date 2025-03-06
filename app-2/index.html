@@ -1,0 +1,816 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="mifare-operations.js"></script>
+    <script>
+        // Status codes and messages
+        const STATUS = {
+            INITIALIZING: { text: 'Initializing card reader...', bgColor: '#e3f2fd', color: '#1565c0' },
+            CONNECTED: { text: 'Reader connected successfully', bgColor: '#e8f5e9', color: '#2e7d32' },
+            CONNECT_FAILED: { text: 'Failed to connect to reader', bgColor: '#ffebee', color: '#c62828' },
+            PERMISSION_DENIED: { text: 'USB Permission denied', bgColor: '#fff3e0', color: '#e65100' },
+            READER_NOT_FOUND: { text: 'D-Logic uFR ZERO reader not found', bgColor: '#ffebee', color: '#c62828' },
+            WAITING_CARD: { text: 'Waiting for card...', bgColor: '#f5f5f5', color: '#616161' },
+            CARD_DETECTED: { text: 'Card detected', bgColor: '#e8f5e9', color: '#2e7d32' },
+            ERROR_READING: { text: 'Error reading card', bgColor: '#ffebee', color: '#c62828' }
+        };
+
+        // Initialize the reader when the page loads
+        window.onload = async function() {
+            // First check if our functions are loaded
+            if (typeof DEFAULT_KEY === 'undefined' || 
+                typeof readBlockInSector === 'undefined' ||
+                typeof isValidHexString === 'undefined') {
+                console.error('Required functions from mifare-operations.js are not loaded.');
+                alert('Error: Required functions not found. Please check the console for details.');
+                return;
+            }
+            
+            console.log('Mifare operations loaded successfully.');
+            updateStatus(STATUS.INITIALIZING);
+            
+            // Check if WebUSB is supported
+            if (!navigator.usb) {
+                updateStatus({
+                    text: 'WebUSB is not supported in this browser. Please use Chrome, Edge, or Opera.',
+                    bgColor: '#ffebee',
+                    color: '#c62828'
+                });
+                return;
+            }
+            
+            try {
+                // Try to initialize the reader
+                const initialized = await initializeReader();
+                if (initialized) {
+                    updateStatus(STATUS.CONNECTED);
+                    
+                    // Start polling for cards
+                    startCardPolling();
+                } else {
+                    updateStatus(STATUS.CONNECT_FAILED);
+                    // Add a button to retry connection
+                    addRetryButton();
+                }
+            } catch (error) {
+                console.error('Error during initialization:', error);
+                if (error.name === 'SecurityError') {
+                    updateStatus(STATUS.PERMISSION_DENIED);
+                    // Add a button to retry with clearer instructions
+                    addRetryButton('Please click to select the D-Logic uFR ZERO reader');
+                } else if (error.message && error.message.includes('No device selected')) {
+                    updateStatus(STATUS.READER_NOT_FOUND);
+                    addRetryButton('Scan for D-Logic uFR ZERO reader');
+                } else {
+                    updateStatus({
+                        text: `Error: ${error.message || 'Unknown error'}`,
+                        bgColor: '#ffebee',
+                        color: '#c62828'
+                    });
+                    addRetryButton();
+                }
+            }
+        };
+        
+        // Helper function to update status display
+        function updateStatus(status) {
+            const statusBox = document.getElementById('status-box');
+            if (statusBox) {
+                statusBox.textContent = status.text;
+                statusBox.style.backgroundColor = status.bgColor;
+                statusBox.style.color = status.color;
+            } else {
+                console.error('Status box element not found in the DOM');
+            }
+        }
+        
+        // Add a retry button when connection fails
+        function addRetryButton(text = 'Retry Connection') {
+            const container = document.getElementById('connection-controls');
+            if (container) {
+                // Clear any existing buttons
+                container.innerHTML = '';
+                
+                // Create new retry button
+                const button = document.createElement('button');
+                button.textContent = text;
+                button.className = 'retry-button';
+                button.onclick = async () => {
+                    updateStatus(STATUS.INITIALIZING);
+                    container.innerHTML = '<p>Connecting...</p>';
+                    try {
+                        const initialized = await initializeReader();
+                        if (initialized) {
+                            updateStatus(STATUS.CONNECTED);
+                            container.innerHTML = '';
+                            startCardPolling();
+                        } else {
+                            updateStatus(STATUS.CONNECT_FAILED);
+                            addRetryButton();
+                        }
+                    } catch (error) {
+                        console.error('Error during retry:', error);
+                        updateStatus({
+                            text: `Error: ${error.message || 'Unknown error'}`,
+                            bgColor: '#ffebee',
+                            color: '#c62828'
+                        });
+                        addRetryButton();
+                    }
+                };
+                container.appendChild(button);
+            }
+        }
+        
+        // Poll for cards
+        function startCardPolling() {
+            updateStatus(STATUS.WAITING_CARD);
+            const cardNumber = document.getElementById('card-number');
+            const cardVisual = document.querySelector('.card-visual');
+            
+            if (!cardNumber || !cardVisual) {
+                console.error('Card display elements not found in the DOM');
+                return;
+            }
+            
+            // Clear any existing polling
+            if (window.cardPollInterval) {
+                clearInterval(window.cardPollInterval);
+            }
+            
+            // Start new polling
+            window.cardPollInterval = setInterval(async () => {
+                try {
+                    const isCardPresent = await checkCardPresence();
+                    if (isCardPresent) {
+                        try {
+                            const uid = await getCardUid();
+                            updateStatus(STATUS.CARD_DETECTED);
+                            cardNumber.textContent = formatCardUid(uid);
+                            cardVisual.style.boxShadow = '0 0 15px #4CAF50';
+                        } catch (err) {
+                            console.error("Error getting card UID:", err);
+                            updateStatus(STATUS.ERROR_READING);
+                            cardNumber.textContent = 'Card detected, but error reading UID';
+                            cardVisual.style.boxShadow = '0 0 15px #FFC107';
+                        }
+                    } else {
+                        updateStatus(STATUS.WAITING_CARD);
+                        cardNumber.textContent = 'Waiting for card...';
+                        cardVisual.style.boxShadow = '0 4px 8px rgba(0, 0, 0, 0.2)';
+                    }
+                } catch (error) {
+                    console.error('Error in card polling:', error);
+                    if (error.message && error.message.includes('device disconnected')) {
+                        updateStatus({
+                            text: 'Reader disconnected. Please reconnect.',
+                            bgColor: '#ffebee',
+                            color: '#c62828'
+                        });
+                        clearInterval(window.cardPollInterval);
+                        addRetryButton('Reconnect Reader');
+                    }
+                }
+            }, 500);
+        }
+        
+        // Helper function to format card UID with colons
+        function formatCardUid(uid) {
+            return uid.match(/.{2}/g).join(':');
+        }
+    </script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            padding: 20px;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .header h1 {
+            color: #1976d2;
+            margin-bottom: 5px;
+        }
+        .status-container {
+            margin-bottom: 20px;
+        }
+        #status-box {
+            padding: 10px 15px;
+            border-radius: 4px;
+            text-align: center;
+            font-weight: 500;
+            background-color: #f5f5f5;
+            transition: all 0.3s ease;
+        }
+        .card-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin-top: 30px;
+        }
+        .card-visual {
+            width: 320px;
+            height: 200px;
+            background: linear-gradient(135deg, #42a5f5, #1976d2);
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            margin-bottom: 20px;
+            position: relative;
+            overflow: hidden;
+            transition: box-shadow 0.3s ease;
+        }
+        .card-visual::before {
+            content: '';
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            width: 40px;
+            height: 30px;
+            border-radius: 4px;
+            background-color: rgba(255, 255, 255, 0.15);
+        }
+        #card-number {
+            font-size: 20px;
+            font-weight: bold;
+            margin-top: 20px;
+            letter-spacing: 1px;
+        }
+        .card-label {
+            font-size: 12px;
+            text-transform: uppercase;
+            margin-bottom: 10px;
+            opacity: 0.8;
+        }
+        #connection-controls {
+            display: flex;
+            justify-content: center;
+            margin-top: 20px;
+        }
+        .retry-button {
+            background-color: #1976d2;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: background-color 0.3s;
+        }
+        .retry-button:hover {
+            background-color: #1565c0;
+        }
+    </style>
+
+<title>uFR ZERO Card Reader</title>
+</head>
+
+<body style="font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f5f5f5; min-height: 100vh; display: flex; justify-content: center; align-items: center;">
+    <div style="background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1); width: 100%; max-width: 800px; margin: 20px;">
+        <h2>uFR ZERO Card Reader</h2>
+        
+        <!-- Status box for reader connection -->
+        <div id="status-box" style="margin: 10px 0; padding: 10px; border-radius: 4px; background-color: #f5f5f5; font-family: monospace;">
+            Loading...
+        </div>
+        
+        <!-- Connection controls for retry buttons -->
+        <div id="connection-controls" style="display: flex; justify-content: center; margin: 15px 0;"></div>
+
+        <div style="margin: 20px 0;">
+            <div class="card-visual" style="position: relative; width: 100%; max-width: 350px; height: 200px; margin: 0 auto; border-radius: 12px; background: linear-gradient(135deg, #234876, #0d1e38); display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2); overflow: hidden; transition: box-shadow 0.3s ease;">
+                <div style="width: 100%; text-align: center; padding: 20px; color: white; z-index: 2;">
+                    <div style="font-size: 18px; font-weight: bold; margin-bottom: 10px; letter-spacing: 2px; font-family: monospace;" id="card-number">Waiting for card...</div>
+                    <div style="font-size: 12px; opacity: 0.7; transition: opacity 0.3s;">
+                        Card Type: MIFARE Classic<br>
+                    </div>
+                </div>
+                <div style="position: absolute; bottom: 0; left: 0; width: 100%; height: 15px; background: rgba(255, 255, 255, 0.2); transition: background-color 0.3s ease;"></div>
+            </div>
+        </div>
+
+        <!-- Mifare Operations Section -->
+        <div style="margin-top: 30px; padding: 20px; background-color: #f9f9f9; border-radius: 8px; border: 1px solid #eaeaea;">
+            <h3 style="margin-top: 0; margin-bottom: 15px; color: #333;">Mifare Card Operations</h3>
+            
+            <div style="display: flex; gap: 10px; margin-bottom: 20px;">
+                <select id="operation-type" style="flex: 1; padding: 8px; border-radius: 4px; border: 1px solid #ddd;">
+                    <option value="read">Read Card Data</option>
+                    <option value="write">Write Card Data</option>
+                    <option value="value">Value Block Operations</option>
+                    <option value="format">Format Card</option>
+                </select>
+                <button id="auth-button" style="padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">Authenticate</button>
+            </div>
+
+            <!-- Read Operations -->
+            <div id="read-operation" style="margin-bottom: 20px; border: 1px solid #ddd; padding: 15px; border-radius: 4px; background-color: white;">
+                <div style="display: flex; margin-bottom: 10px; align-items: center;">
+                    <label for="read-sector" style="width: 80px; margin-right: 10px; font-weight: bold;">Sector:</label>
+                    <input type="number" id="read-sector" min="0" max="15" value="1" style="padding: 6px; border: 1px solid #ddd; border-radius: 4px; width: 100%;">
+                </div>
+                <div style="display: flex; margin-bottom: 10px; align-items: center;">
+                    <label for="read-block" style="width: 80px; margin-right: 10px; font-weight: bold;">Block:</label>
+                    <input type="number" id="read-block" min="0" max="3" value="0" style="padding: 6px; border: 1px solid #ddd; border-radius: 4px; width: 100%;">
+                </div>
+                <button id="read-button" style="padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; margin-bottom: 10px;">Read Block</button>
+                <div style="margin-top: 15px; border: 1px solid #ddd; border-radius: 4px; overflow: hidden;">
+                    <div style="display: flex; justify-content: space-between; padding: 8px; background-color: #f5f5f5; border-bottom: 1px solid #ddd;">
+                        <span>Data (Hex):</span>
+                        <label style="display: flex; align-items: center; cursor: pointer;">
+                            <input type="checkbox" id="read-as-text" style="margin-right: 5px;">
+                            <span>Show as Text</span>
+                        </label>
+                    </div>
+                    <div id="read-result" style="padding: 10px; min-height: 60px; font-family: monospace; white-space: pre-wrap; word-break: break-all;"></div>
+                </div>
+            </div>
+
+            <!-- Write Operations -->
+            <div id="write-operation" style="margin-bottom: 20px; border: 1px solid #ddd; padding: 15px; border-radius: 4px; background-color: white; display: none;">
+                <div style="display: flex; margin-bottom: 10px; align-items: center;">
+                    <label for="write-sector" style="width: 80px; margin-right: 10px; font-weight: bold;">Sector:</label>
+                    <input type="number" id="write-sector" min="0" max="15" value="1" style="padding: 6px; border: 1px solid #ddd; border-radius: 4px; width: 100%;">
+                </div>
+                <div style="display: flex; margin-bottom: 10px; align-items: center;">
+                    <label for="write-block" style="width: 80px; margin-right: 10px; font-weight: bold;">Block:</label>
+                    <input type="number" id="write-block" min="0" max="3" value="0" style="padding: 6px; border: 1px solid #ddd; border-radius: 4px; width: 100%;">
+                </div>
+                <div style="margin-bottom: 10px;">
+                    <label for="write-data" style="display: block; margin-bottom: 5px; font-weight: bold;">Data:</label>
+                    <textarea id="write-data" placeholder="Enter hex data (32 chars max)" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; min-height: 60px; font-family: monospace;"></textarea>
+                </div>
+                <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+                    <label style="display: flex; align-items: center; cursor: pointer;">
+                        <input type="checkbox" id="write-as-text" style="margin-right: 5px;">
+                        <span>Write as Text</span>
+                    </label>
+                    <button id="write-button" style="padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">Write Block</button>
+                </div>
+                <div id="write-result" style="margin-top: 10px; padding: 10px; min-height: 40px; font-family: monospace; white-space: pre-wrap; word-break: break-all;"></div>
+            </div>
+
+            <!-- Value Block Operations -->
+            <div id="value-operation" style="margin-bottom: 20px; border: 1px solid #ddd; padding: 15px; border-radius: 4px; background-color: white; display: none;">
+                <div style="display: flex; margin-bottom: 10px; align-items: center;">
+                    <label for="value-sector" style="width: 80px; margin-right: 10px; font-weight: bold;">Sector:</label>
+                    <input type="number" id="value-sector" min="0" max="15" value="1" style="padding: 6px; border: 1px solid #ddd; border-radius: 4px; width: 100%;">
+                </div>
+                <div style="display: flex; margin-bottom: 10px; align-items: center;">
+                    <label for="value-block" style="width: 80px; margin-right: 10px; font-weight: bold;">Block:</label>
+                    <input type="number" id="value-block" min="0" max="2" value="0" style="padding: 6px; border: 1px solid #ddd; border-radius: 4px; width: 100%;">
+                </div>
+                <div style="display: flex; margin-bottom: 10px; align-items: center;">
+                    <label for="value-amount" style="width: 80px; margin-right: 10px; font-weight: bold;">Value:</label>
+                    <input type="number" id="value-amount" value="10" style="padding: 6px; border: 1px solid #ddd; border-radius: 4px; width: 100%;">
+                </div>
+                <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+                    <button id="read-value-button" style="flex: 1; padding: 8px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">Read</button>
+                    <button id="write-value-button" style="flex: 1; padding: 8px; background-color: #2196F3; color: white; border: none; border-radius: 4px; cursor: pointer;">Write</button>
+                </div>
+                <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+                    <button id="increment-button" style="flex: 1; padding: 8px; background-color: #FF9800; color: white; border: none; border-radius: 4px; cursor: pointer;">Increment</button>
+                    <button id="decrement-button" style="flex: 1; padding: 8px; background-color: #F44336; color: white; border: none; border-radius: 4px; cursor: pointer;">Decrement</button>
+                </div>
+                <div id="value-result" style="margin-top: 10px; padding: 10px; min-height: 40px; font-family: monospace; white-space: pre-wrap; border: 1px solid #ddd; border-radius: 4px;"></div>
+            </div>
+
+            <!-- Format Card -->
+            <div id="format-operation" style="margin-bottom: 20px; border: 1px solid #ddd; padding: 15px; border-radius: 4px; background-color: white; display: none;">
+                <div style="margin-bottom: 10px; color: #F44336; padding: 10px; border: 1px solid #F44336; border-radius: 4px; font-weight: bold;">
+                    Warning: Formatting will reset all sectors to default keys. This operation cannot be undone.
+                </div>
+                <div style="display: flex; margin-bottom: 10px; align-items: center;">
+                    <label for="format-key" style="width: 80px; margin-right: 10px; font-weight: bold;">Current Key:</label>
+                    <input type="text" id="format-key" value="FFFFFFFFFFFF" style="padding: 6px; border: 1px solid #ddd; border-radius: 4px; width: 100%; font-family: monospace;">
+                </div>
+                <button id="format-button" style="padding: 8px 16px; background-color: #F44336; color: white; border: none; border-radius: 4px; cursor: pointer; margin-bottom: 10px;">Format Card</button>
+                <div id="format-result" style="margin-top: 10px; padding: 10px; min-height: 40px; font-family: monospace; white-space: pre-wrap;"></div>
+            </div>
+        </div>
+        
+        <!-- Connection Info -->
+        <div style="margin-top: 20px; padding: 15px; background-color: #f9f9f9; border-radius: 8px; border: 1px solid #eaeaea;">
+            <div style="font-weight: bold; margin-bottom: 10px;">Connection Information</div>
+            <button id="refresh-connection" style="padding: 8px 16px; background-color: #2196F3; color: white; border: none; border-radius: 4px; cursor: pointer; margin-bottom: 10px;">Refresh Connection</button>
+            <div style="font-family: monospace; margin-top: 10px;">
+                <div id="connection-status">Not connected</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Mifare Operations UI Script -->
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const operationType = document.getElementById('operation-type');
+            const authButton = document.getElementById('auth-button');
+            const refreshConnectionButton = document.getElementById('refresh-connection');
+            
+            const readOperation = document.getElementById('read-operation');
+            const writeOperation = document.getElementById('write-operation');
+            const valueOperation = document.getElementById('value-operation');
+            const formatOperation = document.getElementById('format-operation');
+            
+            const readSector = document.getElementById('read-sector');
+            const readBlock = document.getElementById('read-block');
+            const readButton = document.getElementById('read-button');
+            const readAsText = document.getElementById('read-as-text');
+            const readResult = document.getElementById('read-result');
+            
+            const writeSector = document.getElementById('write-sector');
+            const writeBlock = document.getElementById('write-block');
+            const writeAsText = document.getElementById('write-as-text');
+            const writeData = document.getElementById('write-data');
+            const writeButton = document.getElementById('write-button');
+            const writeResult = document.getElementById('write-result');
+            
+            const valueSector = document.getElementById('value-sector');
+            const valueBlock = document.getElementById('value-block');
+            const valueAmount = document.getElementById('value-amount');
+            const readValueButton = document.getElementById('read-value-button');
+            const writeValueButton = document.getElementById('write-value-button');
+            const incrementButton = document.getElementById('increment-button');
+            const decrementButton = document.getElementById('decrement-button');
+            const valueResult = document.getElementById('value-result');
+            
+            const formatKey = document.getElementById('format-key');
+            const formatButton = document.getElementById('format-button');
+            const formatResult = document.getElementById('format-result');
+            
+            // Refresh connection button
+            refreshConnectionButton.addEventListener('click', async () => {
+                const connectionStatus = document.getElementById('connection-status');
+                connectionStatus.textContent = 'Refreshing connection...';
+                
+                // First disconnect if already connected
+                await disconnectReader();
+                
+                // Then try to connect again
+                const initialized = await initializeReader();
+                if (initialized) {
+                    connectionStatus.textContent = 'Connected to reader successfully.';
+                    document.getElementById('status-box').textContent = 'Reader connected successfully';
+                    document.getElementById('status-box').style.backgroundColor = '#e8f5e9';
+                    document.getElementById('status-box').style.color = '#2e7d32';
+                } else {
+                    connectionStatus.textContent = 'Failed to connect to reader. Please check if it is properly connected.';
+                    document.getElementById('status-box').textContent = 'Failed to connect to reader';
+                    document.getElementById('status-box').style.backgroundColor = '#ffebee';
+                    document.getElementById('status-box').style.color = '#c62828';
+                }
+            });
+            
+            // Switch between operation panels
+            operationType.addEventListener('change', () => {
+                // Hide all panels
+                readOperation.style.display = 'none';
+                writeOperation.style.display = 'none';
+                valueOperation.style.display = 'none';
+                formatOperation.style.display = 'none';
+                
+                // Show selected panel
+                switch (operationType.value) {
+                    case 'read':
+                        readOperation.style.display = 'block';
+                        break;
+                    case 'write':
+                        writeOperation.style.display = 'block';
+                        break;
+                    case 'value':
+                        valueOperation.style.display = 'block';
+                        break;
+                    case 'format':
+                        formatOperation.style.display = 'block';
+                        break;
+                }
+            });
+            
+            // Authenticate to a sector
+            authButton.addEventListener('click', async () => {
+                let sector = 0;
+                const key = DEFAULT_KEY;
+                
+                // Get the correct sector based on the active panel
+                switch (operationType.value) {
+                    case 'read':
+                        sector = parseInt(readSector.value);
+                        break;
+                    case 'write':
+                        sector = parseInt(writeSector.value);
+                        break;
+                    case 'value':
+                        sector = parseInt(valueSector.value);
+                        break;
+                }
+                
+                // Display authentication attempt message
+                const resultElement = getResultElement();
+                resultElement.textContent = `Attempting to authenticate to sector ${sector}...`;
+                
+                try {
+                    const success = await authenticateSector(sector, key, KEY_A);
+                    if (success) {
+                        resultElement.textContent = `Authentication successful for sector ${sector}`;
+                        resultElement.style.color = '#2e7d32';
+                        resultElement.style.backgroundColor = '#e8f5e9';
+                        resultElement.style.padding = '8px';
+                        resultElement.style.borderRadius = '4px';
+                    } else {
+                        resultElement.textContent = `Authentication failed for sector ${sector}`;
+                        resultElement.style.color = '#c62828';
+                        resultElement.style.backgroundColor = '#ffebee';
+                        resultElement.style.padding = '8px';
+                        resultElement.style.borderRadius = '4px';
+                    }
+                } catch (error) {
+                    resultElement.textContent = error.message;
+                    resultElement.style.color = '#c62828';
+                    resultElement.style.backgroundColor = '#ffebee';
+                    resultElement.style.padding = '8px';
+                    resultElement.style.borderRadius = '4px';
+                }
+            });
+            
+            // Read a block
+            readButton.addEventListener('click', async () => {
+                const sector = parseInt(readSector.value);
+                const block = parseInt(readBlock.value);
+                
+                readResult.textContent = `Reading sector ${sector}, block ${block}...`;
+                
+                try {
+                    const hexData = await readBlockInSector(sector, block);
+                    const showAsText = readAsText.checked;
+                    
+                    if (showAsText) {
+                        readResult.textContent = `Hex: ${hexData}\nText: ${hexToString(hexData)}`;
+                    } else {
+                        readResult.textContent = hexData;
+                    }
+                } catch (error) {
+                    readResult.textContent = error.message;
+                }
+            });
+            
+            // Toggle between hex and text view for read result
+            readAsText.addEventListener('change', () => {
+                const text = readResult.textContent;
+                if (!text || text.includes('failed') || text.includes('Reading')) {
+                    return;
+                }
+                
+                // If already showing both formats, don't toggle
+                if (text.includes('Hex:') && text.includes('Text:')) {
+                    return;
+                }
+                
+                // Assume it's a hex string
+                const hexData = text;
+                
+                if (readAsText.checked) {
+                    readResult.textContent = `Hex: ${hexData}\nText: ${hexToString(hexData)}`;
+                } else {
+                    readResult.textContent = hexData;
+                }
+            });
+            
+            // Write data to a block
+            writeButton.addEventListener('click', async () => {
+                const sector = parseInt(writeSector.value);
+                const block = parseInt(writeBlock.value);
+                let data = writeData.value.trim();
+                
+                writeResult.textContent = '';
+                writeResult.style.padding = '8px';
+                writeResult.style.borderRadius = '4px';
+                
+                // Convert text to hex if needed
+                if (writeAsText.checked) {
+                    data = stringToHex(data);
+                } else if (!isValidHexString(data)) {
+                    writeResult.textContent = 'Invalid hex data. Please enter valid hexadecimal characters.';
+                    writeResult.style.backgroundColor = '#ffebee';
+                    writeResult.style.color = '#c62828';
+                    return;
+                }
+                
+                // Pad or truncate to 32 characters (16 bytes)
+                if (data.length < 32) {
+                    data = data.padEnd(32, '0');
+                    writeResult.textContent = 'Data padded to 32 characters (16 bytes).';
+                } else if (data.length > 32) {
+                    data = data.substring(0, 32);
+                    writeResult.textContent = 'Data truncated to 32 characters (16 bytes).';
+                }
+                
+                try {
+                    const success = await writeBlockInSector(sector, block, data);
+                    if (success) {
+                        writeResult.textContent += `\nBlock ${block} in sector ${sector} written successfully`;
+                        writeResult.style.backgroundColor = '#e8f5e9';
+                        writeResult.style.color = '#2e7d32';
+                    } else {
+                        writeResult.textContent += `\nFailed to write block ${block} in sector ${sector}`;
+                        writeResult.style.backgroundColor = '#ffebee';
+                        writeResult.style.color = '#c62828';
+                    }
+                } catch (error) {
+                    writeResult.textContent += `\n${error.message}`;
+                    writeResult.style.backgroundColor = '#ffebee';
+                    writeResult.style.color = '#c62828';
+                }
+            });
+            
+            // Toggle between hex and text input for write data
+            writeAsText.addEventListener('change', () => {
+                if (writeAsText.checked) {
+                    writeData.placeholder = 'Enter text (will be converted to hex)';
+                } else {
+                    writeData.placeholder = 'Enter hex data (32 chars max)';
+                }
+            });
+            
+            // Read value block
+            readValueButton.addEventListener('click', async () => {
+                const sector = parseInt(valueSector.value);
+                const block = parseInt(valueBlock.value);
+                
+                valueResult.textContent = `Reading value from sector ${sector}, block ${block}...`;
+                
+                try {
+                    const result = await readValueBlock(sector, block);
+                    valueResult.textContent = `Value: ${result.value}\nAddress: ${result.address}`;
+                    valueResult.style.backgroundColor = '#e8f5e9';
+                    valueResult.style.color = '#2e7d32';
+                } catch (error) {
+                    valueResult.textContent = error.message;
+                    valueResult.style.backgroundColor = '#ffebee';
+                    valueResult.style.color = '#c62828';
+                }
+            });
+            
+            // Write value block
+            writeValueButton.addEventListener('click', async () => {
+                const sector = parseInt(valueSector.value);
+                const block = parseInt(valueBlock.value);
+                const value = parseInt(valueAmount.value);
+                
+                valueResult.textContent = `Writing value ${value} to sector ${sector}, block ${block}...`;
+                
+                try {
+                    const success = await writeValueBlock(sector, block, value);
+                    if (success) {
+                        valueResult.textContent = `Value ${value} written to block ${block} in sector ${sector} successfully`;
+                        valueResult.style.backgroundColor = '#e8f5e9';
+                        valueResult.style.color = '#2e7d32';
+                    } else {
+                        valueResult.textContent = `Failed to write value to block ${block} in sector ${sector}`;
+                        valueResult.style.backgroundColor = '#ffebee';
+                        valueResult.style.color = '#c62828';
+                    }
+                } catch (error) {
+                    valueResult.textContent = error.message;
+                    valueResult.style.backgroundColor = '#ffebee';
+                    valueResult.style.color = '#c62828';
+                }
+            });
+            
+            // Increment value block
+            incrementButton.addEventListener('click', async () => {
+                const sector = parseInt(valueSector.value);
+                const block = parseInt(valueBlock.value);
+                const amount = parseInt(valueAmount.value);
+                
+                valueResult.textContent = `Incrementing value in sector ${sector}, block ${block} by ${amount}...`;
+                
+                try {
+                    const success = await incrementValueBlock(sector, block, amount);
+                    if (success) {
+                        // Read the new value after increment
+                        try {
+                            const result = await readValueBlock(sector, block);
+                            valueResult.textContent = `Value incremented by ${amount}\nNew value: ${result.value}`;
+                        } catch (readError) {
+                            valueResult.textContent = `Value incremented successfully but failed to read new value: ${readError.message}`;
+                        }
+                        valueResult.style.backgroundColor = '#e8f5e9';
+                        valueResult.style.color = '#2e7d32';
+                    } else {
+                        valueResult.textContent = `Failed to increment value in sector ${sector}, block ${block}`;
+                        valueResult.style.backgroundColor = '#ffebee';
+                        valueResult.style.color = '#c62828';
+                    }
+                } catch (error) {
+                    valueResult.textContent = error.message;
+                    valueResult.style.backgroundColor = '#ffebee';
+                    valueResult.style.color = '#c62828';
+                }
+            });
+            
+            // Decrement value block
+            decrementButton.addEventListener('click', async () => {
+                const sector = parseInt(valueSector.value);
+                const block = parseInt(valueBlock.value);
+                const amount = parseInt(valueAmount.value);
+                
+                valueResult.textContent = `Decrementing value in sector ${sector}, block ${block} by ${amount}...`;
+                
+                try {
+                    const success = await decrementValueBlock(sector, block, amount);
+                    if (success) {
+                        // Read the new value after decrement
+                        try {
+                            const result = await readValueBlock(sector, block);
+                            valueResult.textContent = `Value decremented by ${amount}\nNew value: ${result.value}`;
+                        } catch (readError) {
+                            valueResult.textContent = `Value decremented successfully but failed to read new value: ${readError.message}`;
+                        }
+                        valueResult.style.backgroundColor = '#e8f5e9';
+                        valueResult.style.color = '#2e7d32';
+                    } else {
+                        valueResult.textContent = `Failed to decrement value in sector ${sector}, block ${block}`;
+                        valueResult.style.backgroundColor = '#ffebee';
+                        valueResult.style.color = '#c62828';
+                    }
+                } catch (error) {
+                    valueResult.textContent = error.message;
+                    valueResult.style.backgroundColor = '#ffebee';
+                    valueResult.style.color = '#c62828';
+                }
+            });
+            
+            // Format card
+            formatButton.addEventListener('click', async () => {
+                const key = formatKey.value.trim();
+                
+                if (!isValidHexString(key) || key.length !== 12) {
+                    formatResult.textContent = 'Invalid key format. Please enter 12 hex characters.';
+                    formatResult.style.backgroundColor = '#ffebee';
+                    formatResult.style.color = '#c62828';
+                    formatResult.style.padding = '8px';
+                    formatResult.style.borderRadius = '4px';
+                    return;
+                }
+                
+                formatResult.textContent = 'Formatting card...';
+                
+                try {
+                    const success = await formatCard(key);
+                    if (success) {
+                        formatResult.textContent = 'Card formatted successfully.';
+                        formatResult.style.backgroundColor = '#e8f5e9';
+                        formatResult.style.color = '#2e7d32';
+                    } else {
+                        formatResult.textContent = 'Card format failed. Make sure the card is present and the key is correct.';
+                        formatResult.style.backgroundColor = '#ffebee';
+                        formatResult.style.color = '#c62828';
+                    }
+                    formatResult.style.padding = '8px';
+                    formatResult.style.borderRadius = '4px';
+                } catch (error) {
+                    formatResult.textContent = error.message;
+                    formatResult.style.backgroundColor = '#ffebee';
+                    formatResult.style.color = '#c62828';
+                    formatResult.style.padding = '8px';
+                    formatResult.style.borderRadius = '4px';
+                }
+            });
+            
+            // Helper function to get the appropriate result element based on the active panel
+            function getResultElement() {
+                switch (operationType.value) {
+                    case 'read':
+                        return readResult;
+                    case 'write':
+                        return writeResult;
+                    case 'value':
+                        return valueResult;
+                    case 'format':
+                        return formatResult;
+                    default:
+                        return readResult;
+                }
+            }
+        });
+    </script>
+</body>
+
+</html>

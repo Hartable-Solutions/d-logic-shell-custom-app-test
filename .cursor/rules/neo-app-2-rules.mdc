@@ -1,0 +1,11 @@
+---
+description: Thsi rule set is for the Neoband-app-2
+globs: 
+alwaysApply: true
+---
+#Allowed programming languaes
+
+- html
+- javascript
+
+
